@@ -15,7 +15,7 @@ Execute these phases in order. Stop and report if any phase fails.
 
 ### Phase 1: Apply Code Changes
 
-Apply all 7 file changes described in the [Changes Reference](#changes-reference) section below.
+Apply all 8 file changes described in the [Changes Reference](#changes-reference) section below.
 
 - For **full rewrite** files: replace the entire file content
 - For **targeted edit** files: find the matching code pattern and apply the edit. If the exact pattern doesn't match (upstream changed), use your understanding of the intent to adapt the edit to the current code structure.
@@ -37,8 +37,9 @@ pnpm test
 ### Phase 3: Commit & Push
 
 ```bash
-# Stage only our 7 files
+# Stage only our changed files
 git add \
+  electron-builder.yml \
   src/main/services/AnthropicService.ts \
   src/main/services/agents/BaseService.ts \
   src/main/services/agents/services/claudecode/index.ts \
@@ -55,7 +56,7 @@ git remote get-url personal 2>/dev/null || \
   git remote add personal git@github.com:kennyzheng-builds/cherry-studio-personal.git
 
 # Push current branch as main to personal repo
-git push personal HEAD:main --force-with-lease
+git push personal HEAD:main --force
 ```
 
 ### Phase 4: Build macOS App
@@ -64,13 +65,69 @@ git push personal HEAD:main --force-with-lease
 pnpm build:mac
 ```
 
-After build completes, report the output file path (check `dist/` for `.dmg` files).
+After build completes, report the output file paths (check `dist/` for `.dmg` files).
+The DMG filenames should contain `-claude-oauth-` to distinguish from official builds.
+
+### Phase 5: Prevent Spotlight Indexing of Build Output
+
+macOS Spotlight will index `.app` bundles inside `dist/`, causing duplicate entries in app search.
+Prevent this by placing a `.metadata_never_index` marker file in the `dist/` directory:
+
+```bash
+touch dist/.metadata_never_index
+```
+
+This tells macOS to skip indexing the `dist/` directory, so only the installed copy in `/Applications/` appears in Spotlight search results.
+
+### Phase 6: Sync Built Packages to Personal Repo
+
+After a successful build, create a GitHub release on the personal repo with the built DMG files:
+
+```bash
+# Get version from package.json
+VERSION=$(node -p "require('./package.json').version")
+
+# Create a git tag on the personal repo
+git tag -f "v${VERSION}-claude-oauth" HEAD
+git push personal "v${VERSION}-claude-oauth" --force
+
+# Delete existing release if any, then create new one
+gh release delete "v${VERSION}-claude-oauth" \
+  --repo kennyzheng-builds/cherry-studio-personal \
+  --yes 2>/dev/null || true
+
+# Create GitHub release and upload DMG files
+gh release create "v${VERSION}-claude-oauth" \
+  --repo kennyzheng-builds/cherry-studio-personal \
+  --title "Cherry Studio v${VERSION} (Claude OAuth)" \
+  --notes "Personal build with Claude OAuth support via macOS Keychain" \
+  --latest \
+  dist/*-claude-oauth-*.dmg
+```
 
 ---
 
 ## Changes Reference
 
-### File 1: FULL REWRITE — `src/main/services/AnthropicService.ts`
+### File 1: TARGETED EDIT — `electron-builder.yml`
+
+**Intent:** Append `-claude-oauth` to the macOS DMG filename to distinguish from official builds.
+
+Find the `mac:` section's `artifactName`:
+
+**Before:**
+```yaml
+  artifactName: ${productName}-${version}-${arch}.${ext}
+```
+
+**After:**
+```yaml
+  artifactName: ${productName}-${version}-claude-oauth-${arch}.${ext}
+```
+
+> Only change the `mac:` section's artifactName. Do NOT modify Windows or Linux artifactNames.
+
+### File 2: FULL REWRITE — `src/main/services/AnthropicService.ts`
 
 Replace the entire file. This service reads OAuth tokens from macOS Keychain (where Claude Code CLI stores them), caches in memory, and auto-refreshes expired tokens.
 
@@ -315,7 +372,7 @@ class AnthropicService {
 export default new AnthropicService()
 ```
 
-### File 2: FULL REWRITE — `src/renderer/src/pages/settings/ProviderSettings/AnthropicSettings.tsx`
+### File 3: FULL REWRITE — `src/renderer/src/pages/settings/ProviderSettings/AnthropicSettings.tsx`
 
 Replace the entire file. Simplified from multi-step OAuth flow to Keychain credential detection.
 
@@ -400,7 +457,7 @@ const Container = styled.div`
 export default AnthropicSettings
 ```
 
-### File 3: TARGETED EDIT — `src/main/services/agents/BaseService.ts`
+### File 4: TARGETED EDIT — `src/main/services/agents/BaseService.ts`
 
 **Intent:** Skip API key validation for Anthropic provider (uses OAuth from Keychain).
 
@@ -428,19 +485,19 @@ if (!validation.provider.apiKey) {
     throw new AgentModelValidationError(
 ```
 
-### File 4: TARGETED EDIT — `src/main/services/agents/services/claudecode/index.ts`
+### File 5: TARGETED EDIT — `src/main/services/agents/services/claudecode/index.ts`
 
 **Intent:** For Anthropic provider, read OAuth token from Keychain and pass via `CLAUDE_CODE_OAUTH_TOKEN` env var (triggers SDK's native OAuth headers). Use `~/.claude` config dir for OAuth.
 
-#### 4a. Add import (near other `@main` imports):
+#### 5a. Add import (near other `@main` imports):
 ```typescript
 import anthropicService from '@main/services/AnthropicService'
 ```
 
-#### 4b. Add OAuth token retrieval (after the `modelInfo.provider.apiKey = modelInfo.provider.id` fallback block, before `const apiConfig`):
+#### 5b. Add OAuth token retrieval (after the `provider.apiKey = provider.id` fallback block, before `const apiConfig`):
 ```typescript
 // For personal build: Anthropic always uses OAuth from Claude Code keychain
-const isOAuthProvider = modelInfo.provider.id === 'anthropic'
+const isOAuthProvider = provider.id === 'anthropic'
 
 // For OAuth: read token from keychain and pass via CLAUDE_CODE_OAUTH_TOKEN
 // This triggers the SDK's native OAuth code path with proper headers.
@@ -460,41 +517,51 @@ if (isOAuthProvider) {
 }
 ```
 
-#### 4c. Replace CLAUDE_CONFIG_DIR (find `CLAUDE_CONFIG_DIR: path.join(app.getPath('userData'), '.claude')`):
-
-Add before the `env` object:
-```typescript
-const claudeConfigDir = isOAuthProvider
-  ? path.join(process.env.HOME || require('os').homedir(), '.claude')
-  : path.join(app.getPath('userData'), '.claude')
-```
-
-Then in the env object use: `CLAUDE_CONFIG_DIR: claudeConfigDir,`
-
-#### 4d. Replace API key env vars (find `ANTHROPIC_API_KEY:` and `ANTHROPIC_AUTH_TOKEN:` lines):
+#### 5c. Replace CLAUDE_CONFIG_DIR (find `CLAUDE_CONFIG_DIR: path.join(app.getPath('userData'), '.claude')`):
 
 **Before:**
 ```typescript
-ANTHROPIC_API_KEY: modelInfo.provider.apiKey,
-ANTHROPIC_AUTH_TOKEN: modelInfo.provider.apiKey,
+      // Set CLAUDE_CONFIG_DIR to app's userData directory to avoid path encoding issues
+      // on Windows when the username contains non-ASCII characters (e.g., Chinese characters)
+      // This prevents the SDK from using the user's home directory which may have encoding problems
+      CLAUDE_CONFIG_DIR: path.join(app.getPath('userData'), '.claude'),
 ```
 
 **After:**
 ```typescript
-// For OAuth: use CLAUDE_CODE_OAUTH_TOKEN which triggers the SDK's native OAuth
-// code path with proper headers (anthropic-beta: oauth-2025-04-20, etc.)
-// ANTHROPIC_AUTH_TOKEN does NOT trigger OAuth headers and gets rejected.
-...(isOAuthProvider
-  ? {
-      CLAUDE_CODE_OAUTH_TOKEN: oauthToken!
-    }
-  : {
-      ANTHROPIC_API_KEY: modelInfo.provider.apiKey,
-      ANTHROPIC_AUTH_TOKEN: modelInfo.provider.apiKey
-    }),
+      // For OAuth: use ~/.claude so the SDK subprocess can find .claude.json for account metadata
+      // For non-OAuth: use app's userData directory to avoid path encoding issues on Windows
+      CLAUDE_CONFIG_DIR: isOAuthProvider
+        ? path.join(process.env.HOME || os.homedir(), '.claude')
+        : path.join(app.getPath('userData'), '.claude'),
 ```
 
-### File 5: TARGETED EDIT — `src/renderer/src/aiCore/provider/providerConfig.ts`
+> Note: `os` is already imported in this file as `import os from 'node:os'`.
+
+#### 5d. Replace API key env vars (find `ANTHROPIC_API_KEY:` and `ANTHROPIC_AUTH_TOKEN:` lines):
+
+**Before:**
+```typescript
+      ANTHROPIC_API_KEY: provider.apiKey,
+      ANTHROPIC_AUTH_TOKEN: provider.apiKey,
+```
+
+**After:**
+```typescript
+      // For OAuth: use CLAUDE_CODE_OAUTH_TOKEN which triggers the SDK's native OAuth
+      // code path with proper headers (anthropic-beta: oauth-2025-04-20, etc.)
+      // ANTHROPIC_AUTH_TOKEN does NOT trigger OAuth headers and gets rejected.
+      ...(isOAuthProvider
+        ? {
+            CLAUDE_CODE_OAUTH_TOKEN: oauthToken!
+          }
+        : {
+            ANTHROPIC_API_KEY: provider.apiKey,
+            ANTHROPIC_AUTH_TOKEN: provider.apiKey
+          }),
+```
+
+### File 6: TARGETED EDIT — `src/renderer/src/aiCore/provider/providerConfig.ts`
 
 **Intent:** Add Claude Code impersonation headers so Anthropic API accepts OAuth tokens for chat.
 
@@ -510,7 +577,7 @@ Find the `buildAnthropicConfig` function's `headers` object. Add these headers b
 
 > **If upstream removes `buildAnthropicConfig`:** find wherever the Anthropic provider config is built and ensure these headers are included when using OAuth auth.
 
-### File 6: TARGETED EDIT — `src/renderer/src/config/providers.ts`
+### File 7: TARGETED EDIT — `src/renderer/src/config/providers.ts`
 
 **Intent:** Mark Anthropic system provider as OAuth-based.
 
@@ -522,11 +589,11 @@ authType: 'oauth'
 
 ---
 
-### File 7: TARGETED EDIT — `src/renderer/src/pages/settings/ProviderSettings/ProviderSetting.tsx`
+### File 8: TARGETED EDIT — `src/renderer/src/pages/settings/ProviderSettings/ProviderSetting.tsx`
 
 **Intent:** For personal build, Anthropic always uses OAuth. Remove the auth method dropdown and always show `<AnthropicSettings />`.
 
-#### 7a. Find `isAnthropicOAuth` function (search for `const isAnthropicOAuth`):
+#### 8a. Find `isAnthropicOAuth` function (search for `const isAnthropicOAuth`):
 
 **Before:**
 ```typescript
@@ -539,7 +606,7 @@ const isAnthropicOAuth = () => provider.id === 'anthropic' && provider.authType 
 const isAnthropicOAuth = () => provider.id === 'anthropic'
 ```
 
-#### 7b. Find the Anthropic auth method selector block (search for `provider.id === 'anthropic'` in the JSX return):
+#### 8b. Find the Anthropic auth method selector block (search for `provider.id === 'anthropic'` in the JSX return):
 
 **Before:**
 ```tsx
@@ -567,20 +634,40 @@ const isAnthropicOAuth = () => provider.id === 'anthropic'
 
 > This removes the auth method dropdown entirely and always renders the OAuth Keychain detection UI for Anthropic.
 
+#### 8c. Clean up unused import
+
+After removing the `<Select>` usage for Anthropic, check if `Select` is still used elsewhere in the file. If not, remove it from the antd import:
+
+**Before:**
+```typescript
+import { Button, Divider, Flex, Input, Select, Space, Switch, Tooltip } from 'antd'
+```
+
+**After:**
+```typescript
+import { Button, Divider, Flex, Input, Space, Switch, Tooltip } from 'antd'
+```
+
+> Only remove `Select` if no other usage exists in the file. Search the file first.
+
 ---
 
 ## Troubleshooting
 
 | Error | Cause | Fix |
 |---|---|---|
-| 401 "OAuth authentication is currently not supported" | Missing Claude Code impersonation headers in chat path | Check File 5 headers |
-| "Not logged in - Please run /login" | Agent SDK can't find OAuth token | Check File 4d uses `CLAUDE_CODE_OAUTH_TOKEN` not `ANTHROPIC_AUTH_TOKEN` |
-| "Provider 'anthropic' is missing an API key" | BaseService blocks empty apiKey | Check File 3 OAuth bypass |
+| 401 "OAuth authentication is currently not supported" | Missing Claude Code impersonation headers in chat path | Check File 6 headers |
+| "Not logged in - Please run /login" | Agent SDK can't find OAuth token | Check File 5d uses `CLAUDE_CODE_OAUTH_TOKEN` not `ANTHROPIC_AUTH_TOKEN` |
+| "Provider 'anthropic' is missing an API key" | BaseService blocks empty apiKey | Check File 4 OAuth bypass |
 | Token expired / null | Keychain credentials missing or expired | Run `claude auth login` in terminal |
+| Multiple Cherry Studio in Spotlight | Build output `.app` indexed by macOS | Check Phase 5 `.metadata_never_index` |
+| DMG filename same as official build | Missing `-claude-oauth` in artifactName | Check File 1 electron-builder.yml |
 
 ## Key Technical Decisions
 
 - **`CLAUDE_CODE_OAUTH_TOKEN`** not `ANTHROPIC_AUTH_TOKEN`: Only `CLAUDE_CODE_OAUTH_TOKEN` triggers the Claude Agent SDK's native OAuth code path which sends `anthropic-beta: oauth-2025-04-20` and other required headers.
 - **macOS Keychain**: Claude Code CLI stores credentials there. We read directly, avoiding duplication.
 - **`CLAUDE_CONFIG_DIR: ~/.claude`** for OAuth: The SDK subprocess needs `.claude.json` for account metadata.
-- **Personal repo**: `git@github.com:kennyzheng-builds/cherry-studio-personal.git` (remote name: `personal`)
+- **`-claude-oauth` in DMG filename**: Distinguishes personal OAuth builds from official Cherry Studio releases.
+- **`.metadata_never_index`**: Prevents macOS Spotlight from indexing `.app` bundles in `dist/`, avoiding duplicate entries in app search.
+- **Personal repo**: `git@github.com:kennyzheng-builds/cherry-studio-personal.git` (remote name: `personal`). Code is force-pushed to `main`, and built DMGs are uploaded as GitHub releases.
